@@ -134,13 +134,29 @@ fn translation_system_prompt(target_language: &str) -> String {
     )
 }
 
-fn build_chunk_summary_user_prompt(chunk: &str) -> String {
+fn is_sa_meeting_protocol_template(template_id: &str) -> bool {
+    template_id == "sa_meeting_protocol"
+}
+
+fn build_chunk_summary_user_prompt(template_id: &str, chunk: &str) -> String {
+    if is_sa_meeting_protocol_template(template_id) {
+        return format!(
+            "{ENGLISH_BASE_SUMMARY_INSTRUCTION}\n\nAnalyze the following transcript chunk for a systems analyst meeting protocol. Extract only facts explicitly present in the chunk. Capture agreements, follow-up actions, decisions, requirements or changes, open questions, risks, disputed points, and anything that should be manually verified later. If an item is only implied, mark it as probable and cite the basis. If owner, due date, affected system, module, artifact, or decision is not stated, write \"not specified\".\n\nReturn a structured English working note with these headings exactly:\n- Context\n- Key Takeaways\n- Agreements\n- Follow-up Actions\n- Decisions\n- Requirements and Changes\n- Open Questions\n- Risks and Disputed Points\n- Manual Verification Notes\n\n<transcript_chunk>\n{chunk}\n</transcript_chunk>"
+        );
+    }
+
     format!(
         "{ENGLISH_BASE_SUMMARY_INSTRUCTION}\n\nProvide a concise but comprehensive summary of the following transcript chunk. Capture all key points, decisions, action items, and mentioned individuals.\n\n<transcript_chunk>\n{chunk}\n</transcript_chunk>"
     )
 }
 
-fn build_combine_summary_user_prompt(combined_text: &str) -> String {
+fn build_combine_summary_user_prompt(template_id: &str, combined_text: &str) -> String {
+    if is_sa_meeting_protocol_template(template_id) {
+        return format!(
+            "{ENGLISH_BASE_SUMMARY_INSTRUCTION}\n\nThe following are consecutive chunk-level extraction notes for a systems analyst meeting. Merge them into one coherent intermediate summary while preserving all important facts and deduplicating overlaps. Prioritize agreements, follow-up actions, decisions, requirements or changes, open questions, risks, disputed points, and manual verification notes. Do not invent missing facts.\n\nReturn a structured English working note with these headings exactly:\n- Context\n- Key Takeaways\n- Agreements\n- Follow-up Actions\n- Decisions\n- Requirements and Changes\n- Open Questions\n- Risks and Disputed Points\n- Manual Verification Notes\n\n<summaries>\n{combined_text}\n</summaries>"
+        );
+    }
+
     format!(
         "{ENGLISH_BASE_SUMMARY_INSTRUCTION}\n\nThe following are consecutive summaries of a meeting. Combine them into a single, coherent, and detailed narrative summary that retains all important details, organized logically.\n\n<summaries>\n{combined_text}\n</summaries>"
     )
@@ -169,6 +185,16 @@ fn build_final_report_system_prompt(
 {clean_template_markdown}
 </template>"#
     )
+}
+
+fn resolve_final_report_system_prompt(template: &Template) -> String {
+    if let Some(prompt) = &template.final_system_prompt {
+        return prompt.clone();
+    }
+
+    let clean_template_markdown = template.to_markdown_structure();
+    let section_instructions = template.to_section_instructions();
+    build_final_report_system_prompt(&section_instructions, &clean_template_markdown)
 }
 
 /// Rough token count estimation using character count
@@ -397,7 +423,7 @@ pub async fn generate_meeting_summary(
                 }
 
                 info!("Processing chunk {}/{}", i + 1, num_chunks);
-                let user_prompt_chunk = build_chunk_summary_user_prompt(chunk);
+                let user_prompt_chunk = build_chunk_summary_user_prompt(template_id, chunk);
 
                 match generate_summary(
                     client,
@@ -451,7 +477,7 @@ pub async fn generate_meeting_summary(
                 );
                 let combined_text = chunk_summaries.join("\n---\n");
                 let system_prompt_combine = "You are an expert at synthesizing meeting summaries.";
-                let user_prompt_combine = build_combine_summary_user_prompt(&combined_text);
+                let user_prompt_combine = build_combine_summary_user_prompt(template_id, &combined_text);
                 generate_summary(
                     client,
                     provider,
@@ -475,12 +501,7 @@ pub async fn generate_meeting_summary(
 
         info!("Generating final markdown report with template: {}", template_id);
 
-        // Generate markdown structure and section instructions using template methods
-        let clean_template_markdown = template.to_markdown_structure();
-        let section_instructions = template.to_section_instructions();
-
-        let final_system_prompt =
-            build_final_report_system_prompt(&section_instructions, &clean_template_markdown);
+        let final_system_prompt = resolve_final_report_system_prompt(template);
 
         let mut final_user_prompt = format!(
             "<transcript_chunks>\n{content_to_summarize}\n</transcript_chunks>\n"
@@ -523,42 +544,19 @@ pub async fn generate_meeting_summary(
         (english_markdown, successful_chunk_count)
     };
 
-    let final_markdown = match resolve_final_language_action(summary_language, detected_transcript_language) {
-        FinalLanguageAction::Translate(name) => {
-            match translate_markdown(
-                client,
-                provider,
-                model_name,
-                api_key,
-                &english_markdown,
-                name,
-                ollama_endpoint,
-                custom_openai_endpoint,
-                max_tokens,
-                temperature,
-                top_p,
-                app_data_dir,
-                cancellation_token,
-            )
-            .await
-            {
-                Ok(translated) => translated,
-                Err(e) => return Err(format!("Translation to {} failed: {}", name, e)),
-            }
-        }
-        FinalLanguageAction::NormalizeEnglish => {
-            info!(
-                "English target with detected transcript language {:?}; running soft English normalization",
-                detected_transcript_language
-            );
-            let normalized = english_markdown_after_normalization_result(
-                &english_markdown,
-                normalize_markdown_to_english(
+    let final_markdown = if template.bypass_language_postprocessing() {
+        info!("Template '{}' bypasses language post-processing", template.name);
+        english_markdown.clone()
+    } else {
+        match resolve_final_language_action(summary_language, detected_transcript_language) {
+            FinalLanguageAction::Translate(name) => {
+                match translate_markdown(
                     client,
                     provider,
                     model_name,
                     api_key,
                     &english_markdown,
+                    name,
                     ollama_endpoint,
                     custom_openai_endpoint,
                     max_tokens,
@@ -567,12 +565,40 @@ pub async fn generate_meeting_summary(
                     app_data_dir,
                     cancellation_token,
                 )
-                .await,
-            )?;
-            english_markdown = normalized.clone();
-            normalized
+                .await
+                {
+                    Ok(translated) => translated,
+                    Err(e) => return Err(format!("Translation to {} failed: {}", name, e)),
+                }
+            }
+            FinalLanguageAction::NormalizeEnglish => {
+                info!(
+                    "English target with detected transcript language {:?}; running soft English normalization",
+                    detected_transcript_language
+                );
+                let normalized = english_markdown_after_normalization_result(
+                    &english_markdown,
+                    normalize_markdown_to_english(
+                        client,
+                        provider,
+                        model_name,
+                        api_key,
+                        &english_markdown,
+                        ollama_endpoint,
+                        custom_openai_endpoint,
+                        max_tokens,
+                        temperature,
+                        top_p,
+                        app_data_dir,
+                        cancellation_token,
+                    )
+                    .await,
+                )?;
+                english_markdown = normalized.clone();
+                normalized
+            }
+            FinalLanguageAction::ReturnEnglish => english_markdown.clone(),
         }
-        FinalLanguageAction::ReturnEnglish => english_markdown.clone(),
     };
 
     info!("Summary generation completed successfully");
@@ -708,10 +734,11 @@ async fn normalize_markdown_to_english(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::summary::templates::TemplateSection;
 
     #[test]
     fn chunk_summary_prompt_forces_english_base_output() {
-        let prompt = build_chunk_summary_user_prompt("会議の内容");
+        let prompt = build_chunk_summary_user_prompt("standard_meeting", "会議の内容");
 
         assert!(prompt.contains(ENGLISH_BASE_SUMMARY_INSTRUCTION));
         assert!(prompt.contains("<transcript_chunk>"));
@@ -719,10 +746,31 @@ mod tests {
 
     #[test]
     fn combine_summary_prompt_forces_english_base_output() {
-        let prompt = build_combine_summary_user_prompt("chunk one\n---\nchunk two");
+        let prompt = build_combine_summary_user_prompt("standard_meeting", "chunk one\n---\nchunk two");
 
         assert!(prompt.contains(ENGLISH_BASE_SUMMARY_INSTRUCTION));
         assert!(prompt.contains("<summaries>"));
+    }
+
+    #[test]
+    fn sa_chunk_prompt_targets_protocol_specific_fields() {
+        let prompt = build_chunk_summary_user_prompt("sa_meeting_protocol", "chunk");
+
+        assert!(prompt.contains("systems analyst meeting protocol"));
+        assert!(prompt.contains("Agreements"));
+        assert!(prompt.contains("Follow-up Actions"));
+        assert!(prompt.contains("Open Questions"));
+        assert!(prompt.contains("Risks and Disputed Points"));
+        assert!(prompt.contains("Manual Verification Notes"));
+    }
+
+    #[test]
+    fn sa_combine_prompt_targets_protocol_specific_fields() {
+        let prompt = build_combine_summary_user_prompt("sa_meeting_protocol", "part one");
+
+        assert!(prompt.contains("chunk-level extraction notes"));
+        assert!(prompt.contains("Requirements and Changes"));
+        assert!(prompt.contains("Do not invent missing facts"));
     }
 
     #[test]
@@ -731,6 +779,30 @@ mod tests {
 
         assert!(prompt.contains(ENGLISH_BASE_SUMMARY_INSTRUCTION));
         assert!(prompt.contains("SECTION-SPECIFIC INSTRUCTIONS"));
+    }
+
+    #[test]
+    fn template_override_prompt_is_used_verbatim() {
+        let template = Template {
+            name: "Custom".to_string(),
+            description: "Custom".to_string(),
+            sections: vec![TemplateSection {
+                title: "One".to_string(),
+                instruction: "Fill it".to_string(),
+                format: "paragraph".to_string(),
+                item_format: None,
+                example_item_format: None,
+            }],
+            markdown_structure: Some("# Fixed".to_string()),
+            final_system_prompt: Some("/no_think\nCustom prompt".to_string()),
+            bypass_language_postprocessing: Some(true),
+        };
+
+        assert_eq!(
+            resolve_final_report_system_prompt(&template),
+            "/no_think\nCustom prompt"
+        );
+        assert!(template.bypass_language_postprocessing());
     }
 
     #[test]

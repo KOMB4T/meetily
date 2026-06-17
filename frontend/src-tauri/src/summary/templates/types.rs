@@ -32,6 +32,18 @@ pub struct Template {
 
     /// List of sections in the template
     pub sections: Vec<TemplateSection>,
+
+    /// Optional exact Markdown structure for the final report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub markdown_structure: Option<String>,
+
+    /// Optional full system prompt override for final report generation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_system_prompt: Option<String>,
+
+    /// Optional flag to skip the post-generation language normalization/translation pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bypass_language_postprocessing: Option<bool>,
 }
 
 impl Template {
@@ -72,6 +84,10 @@ impl Template {
 
     /// Generates a clean markdown template structure
     pub fn to_markdown_structure(&self) -> String {
+        if let Some(markdown_structure) = &self.markdown_structure {
+            return markdown_structure.clone();
+        }
+
         let mut markdown = String::from("# <Add Title here>\n\n");
 
         for section in &self.sections {
@@ -107,6 +123,10 @@ impl Template {
 
         instructions
     }
+
+    pub fn bypass_language_postprocessing(&self) -> bool {
+        self.bypass_language_postprocessing.unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
@@ -127,6 +147,9 @@ mod tests {
                     example_item_format: None,
                 },
             ],
+            markdown_structure: None,
+            final_system_prompt: None,
+            bypass_language_postprocessing: None,
         };
 
         assert!(template.validate().is_ok());
@@ -138,6 +161,9 @@ mod tests {
             name: "".to_string(),
             description: "A test template".to_string(),
             sections: vec![],
+            markdown_structure: None,
+            final_system_prompt: None,
+            bypass_language_postprocessing: None,
         };
 
         assert!(template.validate().is_err());
@@ -157,6 +183,9 @@ mod tests {
                     example_item_format: None,
                 },
             ],
+            markdown_structure: None,
+            final_system_prompt: None,
+            bypass_language_postprocessing: None,
         };
 
         assert!(template.validate().is_err());

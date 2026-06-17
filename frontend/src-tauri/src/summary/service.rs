@@ -731,6 +731,9 @@ mod tests {
                 item_format: None,
                 example_item_format: None,
             }],
+            markdown_structure: None,
+            final_system_prompt: None,
+            bypass_language_postprocessing: None,
         }
     }
 
